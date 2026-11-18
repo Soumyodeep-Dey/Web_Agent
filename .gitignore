@@ -1,0 +1,6 @@
+.env
+.venv/
+.chrome-profile/
+logs/
+__pycache__/
+*.py[cod]
