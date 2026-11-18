@@ -4,14 +4,14 @@ Give the agent a starting URL and describe the result you want. It opens Google 
 
 ## Set up on Windows
 
-Install Python 3.10 or newer and Google Chrome. Run these commands in PowerShell from this folder.
+Install Python 3.11 or newer and Google Chrome. Run these commands in PowerShell from this folder.
 
 ```powershell
 python -m venv .venv
 & .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-If `python` opens the Microsoft Store or fails to start, use the full path to your installed `python.exe` in the first command. If `.env` is missing, copy `.env.example` to `.env`. Paste your [OpenAI API key](https://platform.openai.com/api-keys) into `OPENAI_API_KEY` in `.env`. The default model is `gpt-4.1-mini`. The key needs API access to the selected model.
+If `python` opens the Microsoft Store or fails to start, use the full path to your installed `python.exe` in the first command. If `.env` is missing, copy `.env.example` to `.env`. Set `GOOGLE_API_KEY` to your Gemini API key. `GEMINI_API_KEY` also works if `GOOGLE_API_KEY` is blank. Set `GOOGLE_MODEL` to select a model available to your project, or leave it blank to use `gemini-3.5-flash-lite`. [Manage Gemini API keys](https://aistudio.google.com/api-keys)
 
 ## Run a task
 
@@ -19,12 +19,14 @@ If `python` opens the Microsoft Store or fails to start, use the full path to yo
 & .\.venv\Scripts\python.exe agent.py --url 'https://example.com' --task 'Read the main heading and tell me what this page is for.'
 ```
 
-Run `agent.py` without options for interactive URL and task prompts. Use `--login` to open the page and sign in manually before the agent begins. The Chrome profile lives in `.chrome-profile/` and retains logins between runs. Run one agent at a time with this profile.
+Run `agent.py` without options for interactive URL and task prompts. Use `--login` to sign in manually before the agent begins. If a sign-in link opens a tab that stays blank, switch back to the original site tab. Once you can see that you are signed in, press Enter in PowerShell. The agent reopens your requested URL using the same Chrome session. The Chrome profile lives in `.chrome-profile/` and retains logins between runs. Run one agent at a time with this profile.
 
 The agent asks for approval before clicking, typing, or sending keys. Check the visible page and the proposed action, then enter `y` to proceed. If the viewport changes while waiting, the agent will take a fresh look. Press `Ctrl+C` to stop. The agent closes its Chrome window at the end of the run.
 
+If Google sign-in displays “This browser or app may not be secure” in the agent window, open Gmail in your regular Chrome window. For Python automation of Gmail, use Google's Gmail API with OAuth in a regular browser. [Gmail API Python quickstart](https://developers.google.com/workspace/gmail/api/quickstart/python)
+
 The terminal shows the log path for each run. Use `--steps 30` to change the default 20-decision limit. Exit code `0` means the model reported a verified result, `1` means the run stopped short or failed, `2` means setup or usage needs attention, and `130` means the terminal interrupted the run or closed input.
 
-The task text and visible browser screenshots are sent to the OpenAI API, which can incur usage charges. Screenshots are held in memory. The log records the initial host, action types, and result or blocker, so the final log message may contain details from the page. Use `--login` to enter credentials directly in Chrome. The agent works inside web pages and can stop on native dialogs, downloads, CAPTCHAs, and highly dynamic pages.
+The task text and visible browser screenshots are sent to the Gemini API, which can count toward your quota and incur usage charges. Screenshots are held in memory. The log records the initial host, action types, and result or blocker, so the final log message may contain details from the page. Use `--login` to enter credentials directly in Chrome. The agent works inside web pages and can stop on native dialogs, downloads, CAPTCHAs, and highly dynamic pages.
 
-[OpenAI API quickstart](https://developers.openai.com/api/docs/quickstart) · [Playwright Chrome support](https://playwright.dev/python/docs/browsers#google-chrome--microsoft-edge)
+[Gemini API quickstart](https://ai.google.dev/gemini-api/docs/quickstart) · [Playwright Chrome support](https://playwright.dev/python/docs/browsers#google-chrome--microsoft-edge)

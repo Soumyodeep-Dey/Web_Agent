@@ -1,5 +1,4 @@
 import argparse
-import base64
 import json
 import logging
 import os
@@ -10,6 +9,7 @@ from uuid import uuid4
 
 
 ROOT = Path(__file__).resolve().parent
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
 WIDTH, HEIGHT = 1100, 750
 KEYS = {"Enter", "Tab", "Shift+Tab", "Escape", "ArrowDown", "ArrowUp", "ControlOrMeta+A", "Backspace"}
 ACTIONS = ["click", "type", "press", "scroll", "back", "wait", "done", "blocked"]
@@ -52,8 +52,10 @@ def http_url(value):
 
 
 def validate_action(command):
+    if not isinstance(command, dict) or command.keys() != ACTION_SCHEMA["properties"].keys():
+        raise ValueError("Gemini returned an action with unexpected or missing fields.")
     action = command["action"]
-    if action not in ACTIONS or not command["message"].strip():
+    if action not in ACTIONS or not isinstance(command["message"], str) or not command["message"].strip():
         raise ValueError("The model returned an unsupported action or empty description.")
     if action == "click" and not (
         type(command["x"]) is int and 0 <= command["x"] < WIDTH
@@ -62,34 +64,41 @@ def validate_action(command):
         raise ValueError("The proposed click is outside the browser viewport.")
     if action == "scroll" and not (type(command["dy"]) is int and 0 < abs(command["dy"]) <= 2000):
         raise ValueError("The proposed scroll must be between 1 and 2000 pixels in either direction.")
-    if action == "press" and command["value"] not in KEYS:
+    if action == "press" and not (isinstance(command["value"], str) and command["value"] in KEYS):
         raise ValueError("The proposed shortcut is outside the supported key list.")
     if action == "type" and not (isinstance(command["value"], str) and 0 < len(command["value"]) <= 4000):
         raise ValueError("The proposed text must contain 1 to 4000 characters.")
 
 
 def choose_action(client, model, task, screenshot, history):
-    image_url = "data:image/png;base64," + base64.b64encode(screenshot).decode("ascii")
+    from google.genai import types
+
     state = {
         "task": task,
         "viewport_pixels": [WIDTH, HEIGHT],
         "allowed_keys": sorted(KEYS),
         "recent_actions": history[-8:],
     }
-    response = client.responses.create(
+    response = client.models.generate_content(
         model=model,
-        instructions=INSTRUCTIONS,
-        store=False,
-        input=[{"role": "user", "content": [
-            {"type": "input_text", "text": json.dumps(state)},
-            {"type": "input_image", "image_url": image_url, "detail": "high"},
-        ]}],
-        text={"format": {"type": "json_schema", "name": "browser_action", "strict": True, "schema": ACTION_SCHEMA}},
-        max_output_tokens=800,
+        contents=[json.dumps(state), types.Part.from_bytes(data=screenshot, mime_type="image/png")],
+        config=types.GenerateContentConfig(
+            system_instruction=INSTRUCTIONS,
+            response_mime_type="application/json",
+            response_json_schema=ACTION_SCHEMA,
+            max_output_tokens=4096,
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        ),
     )
-    if response.status != "completed" or not response.output_text:
-        raise RuntimeError("The API did not return a complete browser action. It may have refused the request.")
-    command = json.loads(response.output_text)
+    reason = response.candidates[0].finish_reason if response.candidates else None
+    if reason != types.FinishReason.STOP or not response.text:
+        if response.prompt_feedback and response.prompt_feedback.block_reason:
+            reason = response.prompt_feedback.block_reason
+        raise RuntimeError(f"Gemini did not return a complete browser action ({reason or 'empty response'}).")
+    try:
+        command = json.loads(response.text)
+    except json.JSONDecodeError:
+        raise ValueError("Gemini returned invalid JSON for the browser action.") from None
     validate_action(command)
     return command
 
@@ -113,15 +122,17 @@ def perform(page, command):
 
 def run(args, log):
     from dotenv import load_dotenv
-    from openai import OpenAI
+    from google import genai
+    from google.genai import errors, types
+    from httpx2 import TransportError
     from playwright.sync_api import Error as BrowserError, sync_playwright
 
     load_dotenv(ROOT / ".env")
-    key = os.getenv("OPENAI_API_KEY", "").strip()
+    key = os.getenv("GOOGLE_API_KEY", "").strip() or os.getenv("GEMINI_API_KEY", "").strip()
     if not key:
-        log.error("Set OPENAI_API_KEY in the project's .env file.")
+        log.error("Set GOOGLE_API_KEY or GEMINI_API_KEY in the project's .env file.")
         return 2
-    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
+    model = os.getenv("GOOGLE_MODEL", "").strip() or DEFAULT_MODEL
     url = http_url(args.url or input("URL: ").strip())
     task = (args.task or input("Task: ")).strip()
     if not task:
@@ -129,7 +140,7 @@ def run(args, log):
 
     history = []
     log.info("Starting Chrome for %s with model %s and a %d-step limit.", urlsplit(url).hostname, model, args.steps)
-    with OpenAI(api_key=key, timeout=45, max_retries=1) as client, sync_playwright() as playwright:
+    with genai.Client(api_key=key, vertexai=False, http_options=types.HttpOptions(timeout=45_000)) as client, sync_playwright() as playwright:
         context = playwright.chromium.launch_persistent_context(
             ROOT / ".chrome-profile", channel="chrome", headless=False,
             viewport={"width": WIDTH, "height": HEIGHT}, device_scale_factor=1,
@@ -138,24 +149,62 @@ def run(args, log):
         try:
             context.set_default_timeout(10_000)
             page = context.pages[0] if context.pages else context.new_page()
+            page.bring_to_front()
+            if args.login:
+                log.info("Opening the sign-in tab for %s.", urlsplit(url).hostname)
+                page.goto(url, wait_until="commit", timeout=25_000)
+                page.bring_to_front()
+                log.info("Waiting for manual sign-in. Screenshot capture is paused.")
+                input("Finish signing in in Chrome. If a new tab stays blank, return to the original site tab. Press Enter here once signed in. ")
+                if page.is_closed():
+                    page = context.new_page()
+                page.bring_to_front()
+
+            # Reopen the requested URL after sign-in so the task starts on the site.
             initial = page.goto(url, wait_until="domcontentloaded", timeout=25_000)
             if initial and initial.status >= 400:
                 log.warning("The starting page returned HTTP %d.", initial.status)
-            if args.login:
-                input("Sign in manually in Chrome, then press Enter here to start the agent. ")
+            existing_tabs = set(context.pages)
 
             for step in range(1, args.steps + 1):
-                open_pages = [tab for tab in context.pages if not tab.is_closed()]
-                if not open_pages:
-                    log.error("Blocked: the Chrome window was closed.")
+                new_tabs = [
+                    tab for tab in context.pages
+                    if tab not in existing_tabs and urlsplit(tab.url).scheme in {"http", "https"}
+                ]
+                if new_tabs:
+                    page = new_tabs[-1]
+                    existing_tabs.update(new_tabs)
+                if page.is_closed():
+                    log.error("Blocked: the task tab was closed.")
                     return 1
-                page = open_pages[-1]
-                if page.url == "about:blank":
-                    page.wait_for_url(lambda current: current != "about:blank", timeout=10_000)
                 http_url(page.url)
-                log.info("Step %d/%d on %s. Reading the Chrome viewport.", step, args.steps, urlsplit(page.url).hostname)
+                host = urlsplit(page.url).hostname
+                if host == "accounts.google.com":
+                    log.error(
+                        "Blocked: Google sign-in is still open. Use --login if you have not signed in. "
+                        "If Google says the browser or app may not be secure, use Gmail in your normal browser "
+                        "or use the Gmail API with OAuth for programmatic access."
+                    )
+                    return 1
+                log.info("Step %d/%d on %s. Reading the Chrome viewport.", step, args.steps, host)
+                page.bring_to_front()
+                observed_url = page.url
                 screenshot = page.screenshot(scale="css", timeout=10_000)
-                command = choose_action(client, model, task, screenshot, history)
+                try:
+                    command = choose_action(client, model, task, screenshot, history)
+                except errors.APIError as error:
+                    guidance = {
+                        400: "Check the API key and model configuration.",
+                        401: "Check that the API key is valid.",
+                        403: "Check API key restrictions and project permissions.",
+                        404: "Check that GOOGLE_MODEL is available to your Gemini project.",
+                        429: "Check the Gemini project's rate limits, quota, and billing.",
+                    }.get(error.code, "Try again after checking Gemini service availability.")
+                    log.error("Gemini API request failed with HTTP %s. %s", error.code, guidance)
+                    return 1
+                except TransportError as error:
+                    log.error("Gemini API connection failed (%s). Check your network and try again.", type(error).__name__)
+                    return 1
                 action = command["action"]
                 if action in {"done", "blocked"}:
                     log.info("%s: %s", action.capitalize(), command["message"])
@@ -168,7 +217,7 @@ def run(args, log):
                     if input("Approve this action? [y/N] ").strip().lower() != "y":
                         log.warning("Blocked: the operator declined a proposed %s at step %d.", action, step)
                         return 1
-                    if page != context.pages[-1] or page.screenshot(scale="css", timeout=10_000) != screenshot:
+                    if page.is_closed() or page.url != observed_url or page.screenshot(scale="css", timeout=10_000) != screenshot:
                         log.warning("The viewport changed before approval. Reconsidering the action.")
                         continue
 
@@ -206,7 +255,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", handlers=[
         logging.StreamHandler(), logging.FileHandler(log_path, encoding="utf-8"),
     ])
-    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpx2").setLevel(logging.WARNING)
     log = logging.getLogger("chrome_agent")
     log.info("Run log: %s", log_path)
     try:
@@ -217,15 +266,8 @@ def main():
     except ImportError:
         log.error("Install dependencies with python -m pip install -r requirements.txt.")
     except Exception as error:
-        status = getattr(error, "status_code", None)
-        if status:
-            log.error("OpenAI API request failed with HTTP %s (%s). Check the API key, model access, quota, and billing.", status, type(error).__name__)
-        elif type(error).__name__ in {"APIConnectionError", "APITimeoutError"}:
-            log.error("OpenAI API connection failed (%s). Check the network and try again.", type(error).__name__)
-        else:
-            # Playwright exceptions can contain full URLs. Keep its headline only.
-            detail = str(error).splitlines()[0] if str(error) else "No error details provided."
-            log.error("Run failed (%s): %s", type(error).__name__, detail)
+        detail = str(error).splitlines()[0] if str(error) else "No error details provided."
+        log.error("Run failed (%s): %s", type(error).__name__, detail)
     return 1
 
 
